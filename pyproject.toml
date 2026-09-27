@@ -127,7 +127,7 @@ dependencies = [
     # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
     # repetition penalty support across speculative and fallback sampling.
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
-    "markitdown[pdf,docx,pptx]==0.1.7",
+    "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
 [project.optional-dependencies]
