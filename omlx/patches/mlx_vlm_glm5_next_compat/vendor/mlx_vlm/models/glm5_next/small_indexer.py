@@ -146,6 +146,67 @@ def _get_batched_kernel():
     return _batched_kernel
 
 
+_MMA_BATCHED_SRC = """
+    const int P = dims[0];
+    const int KSTRIDE = dims[1];
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const int b = int(threadgroup_position_in_grid.z);
+    const int s = int(sg) / 4;
+    const int h0 = (int(sg) % 4) * 8;
+    const int p0 = int(threadgroup_position_in_grid.x) * 8;
+    const short qid = lane / 4;
+    const short fm = (qid & 4) + ((lane / 2) % 4);
+    const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    threadgroup float hs[S][32][8];
+    simdgroup_matrix<float, 8, 8> acc(0.0f);
+    for (int kb = 0; kb < 16; ++kb) {
+        simdgroup_matrix<float, 8, 8> a, v;
+        a.thread_elements()[0] = float(
+            q[((b * S + s) * 32 + h0 + fm) * 128 + kb * 8 + fn]);
+        a.thread_elements()[1] = float(
+            q[((b * S + s) * 32 + h0 + fm) * 128 + kb * 8 + fn + 1]);
+        v.thread_elements()[0] = p0 + fn < P
+            ? float(k[size_t(b) * KSTRIDE + (p0 + fn) * 128 + kb * 8 + fm])
+            : 0.0f;
+        v.thread_elements()[1] = p0 + fn + 1 < P
+            ? float(k[size_t(b) * KSTRIDE + (p0 + fn + 1) * 128 + kb * 8 + fm])
+            : 0.0f;
+        simdgroup_multiply_accumulate(acc, a, v, acc);
+    }
+    hs[s][h0 + fm][fn] = acc.thread_elements()[0];
+    hs[s][h0 + fm][fn + 1] = acc.thread_elements()[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Keep the SIMD head reduction after the MMA dot products. ReLU must
+    // precede weighting because each head can have a negative weight.
+    for (int j = int(sg); j < S * 8; j += S * 4) {
+        const int qs = j / 8, kp = j % 8, p = p0 + kp;
+        const float value = simd_sum(
+            metal::max(hs[qs][lane][kp], 0.0f) * float(w[(b * S + qs) * 32 + lane]));
+        if (lane == 0 && p < P) {
+            bool valid = p < rows[b * 2]
+                && (p + 1) * KPOOL - 1 <= rows[b * 2 + 1] + qs;
+            out[(b * S + qs) * P + p] = valid ? T(value) : T(-1e30f);
+        }
+    }
+"""
+
+_mma_batched_kernel = None
+
+
+def _get_mma_batched_kernel():
+    global _mma_batched_kernel
+    if _mma_batched_kernel is None:
+        _mma_batched_kernel = mx.fast.metal_kernel(
+            name="glm53_dsa_indexer_small_scores_mma_batched",
+            input_names=["q", "k", "w", "rows", "dims"],
+            output_names=["out"],
+            header="#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n",
+            source=_MMA_BATCHED_SRC,
+        )
+    return _mma_batched_kernel
+
+
 def _pool_storage(pool_keys, pool_cache):
     """(keys, batch stride). Reads the backing buffer in place, because the
     sliced ``pooled`` view would be copied for the kernel on every call."""
@@ -171,6 +232,17 @@ def small_scores_batched(q, pool_keys, weights, before, plen, kpool, pool_cache=
     pool_extent = pool_keys.shape[1]
     keys, kstride = _pool_storage(pool_keys, pool_cache)
     rows = mx.array([v for pair in zip(plen, before) for v in pair], dtype=mx.int32)
+    if query_rows in (1, 2) and query_heads == 32 and head_dim == 128:
+        # Pack eight heads against eight keys per SIMD group; wider queries
+        # and other head shapes retain the original score kernel below.
+        return _get_mma_batched_kernel()(
+            inputs=[q, keys, weights, rows, mx.array([pool_extent, kstride], mx.int32)],
+            template=[("T", q.dtype), ("S", query_rows), ("KPOOL", kpool)],
+            grid=(((pool_extent + 7) // 8) * query_rows * 128, 1, batch_size),
+            threadgroup=(query_rows * 128, 1, 1),
+            output_shapes=[(batch_size, query_rows, pool_extent)],
+            output_dtypes=[q.dtype],
+        )[0]
     return _get_batched_kernel()(
         inputs=[
             q.reshape(-1),
