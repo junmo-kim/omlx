@@ -29,7 +29,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1167,6 +1167,7 @@ class PagedSSDBlockMetadata:
     # Chain parent and tail marker; a tail is found through its parent.
     parent_hash: bytes | None = None
     tail_terminal: bool = False
+    cache_priority: str = "normal"
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1185,6 +1186,7 @@ class PagedSSDBlockMetadata:
             "model_name": self.model_name,
             "block_size": self.block_size,
             "cache_signature": self.cache_signature,
+            "cache_priority": self.cache_priority,
         }
         if self.layer_cache_types:
             result["layer_cache_types"] = self.layer_cache_types
@@ -1222,6 +1224,7 @@ class PagedSSDBlockMetadata:
                 bytes.fromhex(data["parent_hash"]) if data.get("parent_hash") else None
             ),
             tail_terminal=bool(data.get("tail_terminal", False)),
+            cache_priority="low" if data.get("cache_priority") == "low" else "normal",
         )
 
 
@@ -1322,6 +1325,12 @@ class PagedSSDCacheIndex:
                 self._index[block_hash].touch()
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
+
+    def promote(self, block_hash: bytes) -> None:
+        with self._lock:
+            metadata = self._index.get(block_hash)
+            if metadata is not None:
+                metadata.cache_priority = "normal"
 
     def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
         """
@@ -1449,6 +1458,7 @@ class GDNCheckpointMetadata:
     block_size: int
     created_at: float
     last_access: float
+    cache_priority: str = "normal"
 
     @property
     def key(self) -> tuple[str, bytes]:
@@ -1782,6 +1792,9 @@ class PagedSSDCacheManager(CacheManager):
         gdn_ssd_split_enabled: bool = False,
         gdn_sidecar_state_dtype: str = "fp32",
         auto_size: bool = False,
+        retained_request_count: int = 0,
+        referenced_hashes: Any = None,
+        reference_lock: Any = None,
     ):
         """
         Initialize the SSD cache manager.
@@ -1837,6 +1850,17 @@ class PagedSSDCacheManager(CacheManager):
                 mode; split blocks use format version 5.
         """
         self._cache_dir = cache_dir
+        self._priority_lock = threading.RLock()
+        self._retention_filename = (
+            "low_priority_requests."
+            + hashlib.sha256(expected_model_name.encode()).hexdigest()
+            + ".json"
+        )
+        self._retained_request_count = max(0, int(retained_request_count))
+        self._retained_low_requests: OrderedDict[str, tuple[bytes, ...]] = OrderedDict()
+        self._retained_low_hashes: Counter[bytes] = Counter()
+        self._referenced_hashes = referenced_hashes
+        self._reference_lock = reference_lock
         self._auto_size = auto_size
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
@@ -1889,6 +1913,7 @@ class PagedSSDCacheManager(CacheManager):
         # signature triggers its own one-shot sweep.
         self._signature_sweep_completed = False
         self._lock = threading.RLock()
+        self._priority_lock = self._lock
 
         # Disk usage cache for dynamic effective max size (30s TTL)
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
@@ -1949,6 +1974,7 @@ class PagedSSDCacheManager(CacheManager):
         if self._cache_dir and not self._hot_cache_only:
             self._init_directories()
             self._scan_existing_files()
+            self._load_low_requests()
 
         # --- Background writer for non-blocking saves ---
         # Recompute the pending-writes cap from THIS cache's block/model
@@ -2136,9 +2162,9 @@ class PagedSSDCacheManager(CacheManager):
 
         # 2. Index second — makes the block discoverable in has_block/contains.
         if not self._index.contains(block_hash):
-            self._enforce_size_limit_for_new_block(blk_meta.file_size)
-            self._incompatible_index.remove(block_hash)
-            self._index.add(blk_meta)
+            if not self._admit_priority_block(blk_meta):
+                self._clear_pending_write(block_hash)
+                return False
 
         # 3. Queue third — enqueue for background writer.
         try:
@@ -2403,6 +2429,11 @@ class PagedSSDCacheManager(CacheManager):
                 return False
             try:
                 os.unlink(file_name, dir_fd=signature_fd)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(
+                        f"{metadata.source_block_hash.hex()}.priority",
+                        dir_fd=signature_fd,
+                    )
             except FileNotFoundError:
                 return True
             return True
@@ -2594,7 +2625,16 @@ class PagedSSDCacheManager(CacheManager):
                         block_size=0,
                         created_at=stat_result.st_ctime,
                         last_access=stat_result.st_mtime,
+                        cache_priority=(
+                            "low"
+                            if file_path.with_suffix(".priority").exists()
+                            and file_path.with_suffix(".priority").read_text() == "low"
+                            else "normal"
+                        ),
                     )
+                    source = self.get_block_metadata(source_hash)
+                    if source is not None:
+                        metadata.cache_priority = source.cache_priority
                     self._gdn_sidecar_index.add(metadata)
                     indexed += 1
                     total_bytes += stat_result.st_size
@@ -2659,7 +2699,28 @@ class PagedSSDCacheManager(CacheManager):
                     # replaced. Account for the full incoming file while the old
                     # entry is protected; on promotion failure the old metadata
                     # is restored below and its file remains intact.
-                    self._enforce_size_limit_for_new_block(staged_stat.st_size)
+                    source = self.get_block_metadata(source_block_hash)
+                    priority = source.cache_priority if source is not None else "normal"
+                    active = self._priority_active(priority == "low")
+                    if active and not self._priority_save_fits(
+                        staged_stat.st_size, incoming_low=priority == "low"
+                    ):
+                        if old is not None:
+                            self._gdn_sidecar_index.add(old)
+                        return None
+                    self._enforce_size_limit_for_new_block(
+                        staged_stat.st_size, incoming_low=priority == "low"
+                    )
+                    if (
+                        active
+                        and self._tracked_ssd_size() + staged_stat.st_size
+                        > self._get_effective_max_size()
+                    ):
+                        if old is not None:
+                            self._gdn_sidecar_index.add(old)
+                        return None
+                    if priority == "low":
+                        self._write_priority_marker(final_path, priority)
                     os.replace(staged_path, final_path)
                     _fsync_parent_dir(final_path)
                     committed_at = time.time()
@@ -2679,6 +2740,7 @@ class PagedSSDCacheManager(CacheManager):
                             block_size=int(block_size),
                             created_at=committed_at,
                             last_access=committed_at,
+                            cache_priority=priority,
                         )
                     )
                     return final_path
@@ -3248,6 +3310,12 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
                 parent_hash=bytes.fromhex(parent_hash_hex) if parent_hash_hex else None,
                 tail_terminal=metadata.get("tail_terminal") == "1",
+                cache_priority=(
+                    "low"
+                    if metadata.get("cache_priority") == "low"
+                    and not file_path.with_suffix(".priority").exists()
+                    else "normal"
+                ),
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
@@ -3288,6 +3356,13 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = _unique_tmp_path(file_path)
+                indexed = self._index.get(block_hash)
+                if (
+                    indexed is not None
+                    and indexed.cache_priority == "normal"
+                    and metadata.get("cache_priority") == "low"
+                ):
+                    metadata = dict(metadata, cache_priority="normal")
                 actual_size = _write_safetensors_no_mx(
                     str(temp_path), tensors_raw, metadata
                 )
@@ -3451,6 +3526,159 @@ class PagedSSDCacheManager(CacheManager):
                 item = None
                 block_hash = tensors_raw = metadata = file_path = None
 
+    @property
+    def low_priority_size(self) -> int:
+        return sum(
+            m.file_size
+            for index in (
+                self._index,
+                self._incompatible_index,
+                self._gdn_sidecar_index,
+            )
+            for m in index.get_all_metadata()
+            if m.cache_priority == "low"
+        )
+
+    @property
+    def retained_low_priority_size(self) -> int:
+        return sum(
+            m.file_size
+            for index in (
+                self._index,
+                self._incompatible_index,
+                self._gdn_sidecar_index,
+            )
+            for m in index.get_all_metadata()
+            if m.cache_priority == "low"
+            and self._retained_low_hashes[
+                (
+                    m.source_block_hash
+                    if isinstance(m, GDNCheckpointMetadata)
+                    else m.block_hash
+                )
+            ]
+        )
+
+    def _remember_low_request(self, request_id: str, hashes: tuple[bytes, ...]) -> None:
+        previous = self._retained_low_requests.pop(request_id, ())
+        self._retained_low_hashes.subtract(previous)
+        self._retained_low_requests[request_id] = hashes
+        self._retained_low_hashes.update(hashes)
+        while len(self._retained_low_requests) > self._retained_request_count:
+            _, expired = self._retained_low_requests.popitem(last=False)
+            self._retained_low_hashes.subtract(expired)
+        self._retained_low_hashes += Counter()  # Drop zero-count expired hashes.
+
+    def record_low_priority_request(self, request_id: str, block_hashes) -> None:
+        """Retain the last M completed low-request chains, using immutable hashes."""
+        with self._priority_lock:
+            self._remember_low_request(request_id, tuple(dict.fromkeys(block_hashes)))
+            self._persist_low_requests()
+
+    def _persist_low_requests(self) -> None:
+        if self._cache_dir is None or self._hot_cache_only:
+            return
+        path = self._cache_dir / self._retention_filename
+        temp = _unique_tmp_path(path)
+        try:
+            rows = [
+                {"request_id": rid, "hashes": [h.hex() for h in hashes]}
+                for rid, hashes in self._retained_low_requests.items()
+            ]
+            with open(temp, "w") as stream:
+                json.dump(rows, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, path)
+            _fsync_parent_dir(path)
+        except OSError as exc:
+            logger.warning("Cannot persist low-priority completion history: %s", exc)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _load_low_requests(self) -> None:
+        if self._cache_dir is None or self._hot_cache_only:
+            return
+        path = self._cache_dir / self._retention_filename
+        try:
+            rows = json.loads(path.read_text())
+            # Parse the whole bounded history before publishing any of it.
+            parsed = [
+                (row["request_id"], tuple(bytes.fromhex(h) for h in row["hashes"]))
+                for row in rows
+            ]
+            for rid, hashes in parsed:
+                self._remember_low_request(rid, hashes)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            logger.warning("Cannot load low-priority completion history: %s", exc)
+
+    def _eviction_priority(self, metadata: Any, *, incoming_low: bool = False) -> int:
+        if metadata.cache_priority != "low":
+            return 1 if incoming_low else 2
+        block_hash = (
+            metadata.source_block_hash
+            if isinstance(metadata, GDNCheckpointMetadata)
+            else metadata.block_hash
+        )
+        return (
+            (2 if incoming_low else 1) if self._retained_low_hashes[block_hash] else 0
+        )
+
+    @staticmethod
+    def _write_priority_marker(file_path: Path, priority: str) -> None:
+        marker = file_path.with_suffix(".priority")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temp = _unique_tmp_path(marker)
+        try:
+            with open(temp, "w") as stream:
+                stream.write(priority)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, marker)
+            _fsync_parent_dir(marker)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def promote_block(self, block_hash: bytes) -> None:
+        """Persist a monotonic promotion without rewriting a large KV payload.
+
+        A tiny promotion marker is overlaid on file metadata during rebuild.
+        It is removed with the block. Pending and hot entries share metadata,
+        so their eventual writer also observes the promoted priority.
+        """
+        with self._priority_lock:
+            metadata = self.get_block_metadata(block_hash)
+            if metadata is None:
+                return
+            low_sidecars = [
+                m
+                for m in self._gdn_sidecar_index.get_all_metadata()
+                if m.source_block_hash == block_hash and m.cache_priority == "low"
+            ]
+            if metadata.cache_priority != "low" and not low_sidecars:
+                return
+            if not self._hot_cache_only:
+                try:
+                    self._write_priority_marker(metadata.file_path, "normal")
+                    for sidecar in low_sidecars:
+                        self._write_priority_marker(sidecar.file_path, "normal")
+                except OSError as exc:
+                    logger.warning("Cannot persist cache-priority promotion: %s", exc)
+            for sidecar in low_sidecars:
+                sidecar.cache_priority = "normal"
+            self._index.promote(block_hash)
+            metadata.cache_priority = "normal"
+            with self._hot_cache_lock:
+                entry = self._hot_cache.get(block_hash)
+                if entry is not None:
+                    entry["file_metadata"]["cache_priority"] = "normal"
+            with self._pending_write_hashes_lock:
+                entry = self._pending_write_buffers.get(block_hash)
+                if entry is not None:
+                    entry["file_metadata"]["cache_priority"] = "normal"
+
     def save_block(
         self,
         block_hash: bytes,
@@ -3463,6 +3691,7 @@ class PagedSSDCacheManager(CacheManager):
         replace_existing: bool = False,
         parent_hash: bytes | None = None,
         tail_terminal: bool = False,
+        cache_priority: str = "normal",
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3498,6 +3727,10 @@ class PagedSSDCacheManager(CacheManager):
             logger.error("MLX not available, cannot save block")
             return False
 
+        cache_priority = "low" if cache_priority == "low" else "normal"
+        existing = self.get_block_metadata(block_hash)
+        if existing is not None and existing.cache_priority == "normal":
+            cache_priority = "normal"
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
 
         for i, layer_data in enumerate(cache_data):
@@ -3534,13 +3767,17 @@ class PagedSSDCacheManager(CacheManager):
                 if affine_class in _AFFINE8_CACHE_TYPES
                 else None
             )
-            if bool(affine_class) != bool(affine_marker) or (
-                affine_marker
-                and (
-                    affine_marker != expected_marker
-                    or affine_scheme != affine_marker[2:-2]
+            if (
+                bool(affine_class) != bool(affine_marker)
+                or (
+                    affine_marker
+                    and (
+                        affine_marker != expected_marker
+                        or affine_scheme != affine_marker[2:-2]
+                    )
                 )
-            ) or (affine_scheme and not affine_marker):
+                or (affine_scheme and not affine_marker)
+            ):
                 logger.warning("Affine layer %d: class/payload mismatch", i)
                 return False
             if affine_marker:
@@ -3569,6 +3806,8 @@ class PagedSSDCacheManager(CacheManager):
             and not replace_existing
             and self._is_compatible_block(indexed_metadata)
         ):
+            if cache_priority != "low":
+                self.promote_block(block_hash)
             self._index.touch(block_hash)
             self._stats["hits"] += 1
             return True
@@ -3608,6 +3847,8 @@ class PagedSSDCacheManager(CacheManager):
                 hot_entry = None
 
         if hot_entry is not None and not replace_existing:
+            if cache_priority != "low":
+                self.promote_block(block_hash)
             if hot_cache_write_back or self._hot_cache_only:
                 self._stats["hits"] += 1
                 return True
@@ -3800,6 +4041,8 @@ class PagedSSDCacheManager(CacheManager):
                 "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
+            if cache_priority == "low":
+                metadata["cache_priority"] = "low"
             if parent_hash is not None:
                 metadata["parent_hash"] = parent_hash.hex()
             if tail_terminal:
@@ -3864,6 +4107,7 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
                 parent_hash=parent_hash,
                 tail_terminal=tail_terminal,
+                cache_priority=cache_priority,
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -3920,11 +4164,8 @@ class PagedSSDCacheManager(CacheManager):
             # Evict LRU blocks to make room for the new block. Done here
             # (post-tensor-build) so the actual block size is known and the
             # cache doesn't oscillate around the configured limit.
-            self._enforce_size_limit_for_new_block(estimated_size)
-
-            # SSD path: add to index for SSD file tracking
-            self._incompatible_index.remove(block_hash)
-            self._index.add(block_metadata)
+            if not self._admit_priority_block(block_metadata):
+                return False
 
             # Hot cache disabled: use temporary buffer + immediate SSD write
             cache_entry["staging"] = True
@@ -4417,6 +4658,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "cache_priority": blk_meta.cache_priority,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4453,6 +4695,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": blk_meta.model_name,
                 "block_size": blk_meta.block_size,
                 "cache_signature": blk_meta.cache_signature,
+                "cache_priority": blk_meta.cache_priority,
                 "layer_cache_types": entry["layer_cache_types"],
                 "layer_meta_states": blk_meta.layer_meta_states,
             }
@@ -4526,6 +4769,7 @@ class PagedSSDCacheManager(CacheManager):
                 "model_name": block_metadata.model_name,
                 "block_size": block_metadata.block_size,
                 "cache_signature": block_metadata.cache_signature,
+                "cache_priority": block_metadata.cache_priority,
                 "layer_cache_types": layer_cache_types,
                 "layer_meta_states": block_metadata.layer_meta_states,
             }
@@ -4971,6 +5215,7 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 if metadata.file_path.exists():
                     metadata.file_path.unlink()
+                    metadata.file_path.with_suffix(".priority").unlink(missing_ok=True)
                     logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
                 return True
             except Exception as e:
@@ -5036,10 +5281,76 @@ class PagedSSDCacheManager(CacheManager):
             disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
             return min(self._max_size, disk_limit)
 
+    def _priority_active(self, incoming_low: bool = False) -> bool:
+        if incoming_low or self.low_priority_size:
+            return True
+        with self._hot_cache_lock:
+            return any(
+                entry.get("block_metadata") is not None
+                and entry["block_metadata"].cache_priority == "low"
+                for entry in self._hot_cache.values()
+            )
+
+    def _protected_hashes(self, *, incoming_low: bool = False) -> set[bytes]:
+        # With no low-priority blocks, protect nothing: requests without the
+        # header keep plain LRU eviction, including of pending writes.
+        if not self._priority_active(incoming_low):
+            return set()
+        protected = set(self._referenced_hashes()) if self._referenced_hashes else set()
+        with self._pending_write_hashes_lock:
+            protected.update(self._pending_write_hashes)
+        return protected
+
+    def _priority_save_fits(self, size: int, *, incoming_low: bool) -> bool:
+        limit = self._get_effective_max_size()
+        protected = self._protected_hashes(incoming_low=incoming_low)
+        protected_bytes = sum(
+            m.file_size
+            for index in (
+                self._index,
+                self._incompatible_index,
+                self._gdn_sidecar_index,
+            )
+            for m in index.get_all_metadata()
+            if (
+                m.source_block_hash
+                if isinstance(m, GDNCheckpointMetadata)
+                else m.block_hash
+            )
+            in protected
+        )
+        return protected_bytes + size <= limit
+
+    def _admit_priority_block(self, metadata: Any) -> bool:
+        """Skip an unsatisfiable priority save instead of evicting in-use KV."""
+        with self._priority_lock:
+            incoming_low = metadata.cache_priority == "low"
+            active = self._priority_active(incoming_low)
+            if active and not self._priority_save_fits(
+                metadata.file_size, incoming_low=incoming_low
+            ):
+                return False
+            self._enforce_size_limit_for_new_block(
+                metadata.file_size, incoming_low=incoming_low
+            )
+            if (
+                active
+                and self._tracked_ssd_size() + metadata.file_size
+                > self._get_effective_max_size()
+            ):
+                return False
+            self._incompatible_index.remove(metadata.block_hash)
+            with self._pending_write_hashes_lock:
+                self._pending_write_hashes.add(metadata.block_hash)
+            self._index.add(metadata)
+            return True
+
     def _evict_tracked_until_size(
         self,
         target_size: int,
         max_count: int | None = None,
+        *,
+        incoming_low: bool = False,
     ) -> list[tuple[Any, Any]]:
         """Remove globally oldest tracked main or sidecar files.
 
@@ -5049,40 +5360,49 @@ class PagedSSDCacheManager(CacheManager):
         stable key ordering.  This keeps the configured SSD limit safe while
         avoiding a second, competing budget for GDN history.
         """
-        evicted: list[tuple[Any, Any]] = []
+        with self._reference_lock or contextlib.nullcontext():
+            evicted: list[tuple[Any, Any]] = []
 
-        while self._tracked_ssd_size() > target_size:
-            if max_count is not None and len(evicted) >= max_count:
-                break
+            protected = self._protected_hashes(incoming_low=incoming_low)
+            while self._tracked_ssd_size() > target_size:
+                if max_count is not None and len(evicted) >= max_count:
+                    break
 
-            compatible = self._index.get_lru_entries(1)
-            incompatible = self._incompatible_index.get_lru_entries(1)
-            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
-            candidates: list[tuple[float, int, Any, Any]] = []
-            if compatible:
-                candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))
-            if incompatible:
-                candidates.append(
-                    (incompatible[0].last_access, 1, self._incompatible_index, incompatible[0])
+                candidates = []
+                for rank, index in enumerate(
+                    (self._index, self._incompatible_index, self._gdn_sidecar_index)
+                ):
+                    seen_priorities = set()
+                    for candidate in index.get_lru_entries(index.count):
+                        block_hash = (
+                            candidate.source_block_hash
+                            if isinstance(candidate, GDNCheckpointMetadata)
+                            else candidate.block_hash
+                        )
+                        if block_hash in protected:
+                            continue
+                        priority = self._eviction_priority(
+                            candidate, incoming_low=incoming_low
+                        )
+                        if priority in seen_priorities:
+                            continue
+                        seen_priorities.add(priority)
+                        candidates.append(
+                            (priority, candidate.last_access, rank, index, candidate)
+                        )
+                if not candidates:
+                    break
+                _, _, _, source_index, candidate = min(
+                    candidates, key=lambda item: item[:3]
                 )
-            if sidecars:
-                candidates.append(
-                    (sidecars[0].last_access, 2, self._gdn_sidecar_index, sidecars[0])
-                )
-            if not candidates:
-                break
+                if source_index is self._gdn_sidecar_index:
+                    metadata = source_index.remove_key(candidate.key)
+                else:
+                    metadata = source_index.remove(candidate.block_hash)
+                if metadata is not None:
+                    evicted.append((source_index, metadata))
 
-            _, _, source_index, candidate = min(
-                candidates, key=lambda item: (item[0], item[1])
-            )
-            if source_index is self._gdn_sidecar_index:
-                metadata = source_index.remove_key(candidate.key)
-            else:
-                metadata = source_index.remove(candidate.block_hash)
-            if metadata is not None:
-                evicted.append((source_index, metadata))
-
-        return evicted
+            return evicted
 
     def _enforce_size_limit_for_new_block(
         self,
@@ -5090,6 +5410,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         max_unlinks: int | None = None,
         unbounded: bool = False,
+        incoming_low: bool = False,
     ) -> None:
         """Enforce size limit before adding a new block.
 
@@ -5122,8 +5443,7 @@ class PagedSSDCacheManager(CacheManager):
 
         if self._tracked_ssd_size() > target_size:
             evicted = self._evict_tracked_until_size(
-                target_size,
-                max_count=max_count,
+                target_size, max_count=max_count, incoming_low=incoming_low
             )
             # Inline unlinks on the calling thread. Eviction typically returns
             # a single entry per save because the tracked LRU walk stops as
@@ -5204,6 +5524,7 @@ class PagedSSDCacheManager(CacheManager):
                     return
             else:
                 metadata.file_path.unlink(missing_ok=True)
+                metadata.file_path.with_suffix(".priority").unlink(missing_ok=True)
             self._stats["evictions"] += 1
         except OSError as e:
             restore_index = source_index or self._index
@@ -5347,6 +5668,9 @@ class PagedSSDCacheManager(CacheManager):
                         e,
                     )
 
+            self._retained_low_requests.clear()
+            self._retained_low_hashes.clear()
+            self._persist_low_requests()
             logger.info(f"Cleared SSD cache: deleted {count} files")
             return count
 
@@ -5508,6 +5832,10 @@ class PagedSSDCacheManager(CacheManager):
                 "hot_cache_max_formatted": format_bytes(
                     self._effective_hot_cache_max_bytes()
                 ),
+                "low_priority_size": self.low_priority_size,
+                "retained_low_priority_size": self.retained_low_priority_size,
+                "retained_low_request_count": len(self._retained_low_requests),
+                "low_priority_retained_requests": self._retained_request_count,
                 "gdn_sidecar_count": self._gdn_sidecar_index.count,
                 "gdn_sidecar_size_bytes": self._gdn_sidecar_index.total_size,
                 **self._stats,

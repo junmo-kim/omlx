@@ -55,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import anyio
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -2108,11 +2108,14 @@ def _ignore_eos_kwargs(request) -> dict[str, bool]:
 _CACHE_STORE_HEADER = "X-oMLX-Cache-Store"
 
 
-def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
+def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, Any]:
     if http_request is None:
         return {}
     value = http_request.headers.get(_CACHE_STORE_HEADER, "").strip().lower()
-    return {"skip_cache_store": True} if value == "off" else {}
+    result = {"skip_cache_store": True} if value == "off" else {}
+    if http_request.headers.get("X-oMLX-Cache-Priority", "").strip().lower() == "low":
+        result["cache_priority"] = "low"
+    return result
 
 
 def get_model_settings_for_request(model_id: str | None):
@@ -4645,7 +4648,7 @@ async def create_completion(
                                 resolved_model=resolved_model,
                                 response_id=response_id,
                                 inference_request_id=inference_request_id,
-                                skip_cache_store=bool(_cache_store_kwargs(http_request)),
+                                **_cache_store_kwargs(http_request),
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,
@@ -6060,6 +6063,7 @@ async def stream_completion(
     response_id: str | None = None,
     inference_request_id: str | None = None,
     skip_cache_store: bool = False,
+    cache_priority: str = "normal",
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -6118,6 +6122,8 @@ async def stream_completion(
     gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
+    if cache_priority == "low":
+        gen_kwargs["cache_priority"] = "low"
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,

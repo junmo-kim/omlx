@@ -961,6 +961,7 @@ class BlockAwarePrefixCache(CacheManager):
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
         _store_shared_tail: bool = False,
+        cache_priority: str = "normal",
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -1374,6 +1375,8 @@ class BlockAwarePrefixCache(CacheManager):
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
                             ):
                                 self._backfill_checked_hashes.clear()
+                    if cache_priority != "low" and self.paged_ssd_cache is not None:
+                        self.paged_ssd_cache.promote_block(existing_block.block_hash)
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
                     if is_tail_terminal:
@@ -1587,6 +1590,7 @@ class BlockAwarePrefixCache(CacheManager):
                         replace_existing=False,
                         parent_hash=parent_hash,
                         tail_terminal=is_tail_terminal,
+                        cache_priority=cache_priority,
                     )
                     if saved:
                         if split_gdn_layout:
@@ -2262,6 +2266,7 @@ class BlockAwarePrefixCache(CacheManager):
                 block_hash=block_hash,
                 cache_data=new_data,
                 token_count=int(meta.get("token_count") or self.block_size),
+                cache_priority=meta.get("cache_priority", "normal"),
                 model_name=meta.get("model_name", self.paged_cache.model_name),
                 layer_cache_types=types or None,
                 layer_meta_states=meta.get("layer_meta_states"),
@@ -2448,6 +2453,7 @@ class BlockAwarePrefixCache(CacheManager):
                 block_hash=block_hash,
                 cache_data=new_data,
                 token_count=int(meta.get("token_count") or self.block_size),
+                cache_priority=meta.get("cache_priority", "normal"),
                 model_name=meta.get("model_name", self.paged_cache.model_name),
                 layer_cache_types=types or None,
                 layer_meta_states=new_meta,

@@ -1492,11 +1492,19 @@ class TestSchedulerAddRequest:
         scheduler._prepare_prefix_cache_for_request(request)
         scheduler.block_aware_cache.fetch_cache.assert_called_once()
 
+    @pytest.mark.parametrize("cache_priority", ["normal", "low"])
     def test_async_store_cache_worker_forwards_hot_cache_write_back_flag(
-        self, mock_model, mock_tokenizer
+        self, mock_model, mock_tokenizer, cache_priority
     ):
         """The async store worker must pass pressure mode to store_cache."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        if cache_priority == "low":
+            scheduler.requests["req-store"] = Request(
+                request_id="req-store",
+                prompt=[1, 2, 3, 4],
+                sampling_params=SamplingParams(),
+                cache_priority="low",
+            )
         scheduler.block_aware_cache = MagicMock()
         scheduler.block_aware_cache.store_cache.return_value = None
         scheduler.paged_cache_manager = MagicMock()
@@ -1526,6 +1534,7 @@ class TestSchedulerAddRequest:
             extra_key_ranges=None,
             hot_cache_write_back=False,
             _store_tail_terminal=False,
+            **({"cache_priority": "low"} if cache_priority == "low" else {}),
         )
 
     def test_async_store_cache_worker_forwards_tail_terminal_flag(

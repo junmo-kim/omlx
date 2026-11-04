@@ -2939,6 +2939,7 @@ class Scheduler:
                     extra_key_ranges=extra_key_ranges,
                     hot_cache_write_back=hot_cache_write_back,
                     _store_tail_terminal=store_tail_terminal,
+                    **self._cache_priority_kwargs(request_id),
                 )
                 if system_store is not None:
                     # Before the release below, so the shared blocks stay pinned.
@@ -2953,6 +2954,7 @@ class Scheduler:
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
+                self._record_low_priority_request(request_id, block_table)
                 self.paged_cache_manager.release_for_eviction(block_table.block_ids)
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
@@ -3030,6 +3032,7 @@ class Scheduler:
                 hot_cache_write_back=hot_cache_write_back,
                 _store_tail_terminal=True,
                 _store_shared_tail=True,
+                **self._cache_priority_kwargs(request_id),
             )
         except Exception as e:
             logger.debug("System prefix store failed for %s: %s", request_id, e)
@@ -10916,6 +10919,7 @@ class Scheduler:
                     )
             else:
                 request.remaining_tokens = request.prompt_token_ids
+            self._promote_prefix_cache(request)
             # Index matches can outlive their tensor payloads, and successful
             # reconstruction can still be rejected during scheduling. Keep
             # ordinary reuse separate from SpecPrefill's exact static-prefix
@@ -14579,6 +14583,9 @@ class Scheduler:
                                     request_id
                                 )
                             if block_table and self.paged_cache_manager:
+                                self._record_low_priority_request(
+                                    request_id, block_table
+                                )
                                 self.paged_cache_manager.release_for_eviction(
                                     block_table.block_ids
                                 )
@@ -14597,6 +14604,7 @@ class Scheduler:
                             if block_table is None and hasattr(request, "block_table"):
                                 block_table = request.block_table
                         if block_table and self.paged_cache_manager:
+                            self._record_low_priority_request(request_id, block_table)
                             self.paged_cache_manager.release_for_eviction(
                                 block_table.block_ids
                             )
@@ -15327,6 +15335,7 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                 hot_cache_write_back=False,
                 _store_tail_terminal=tail_terminal == len(tokens),
+                **self._cache_priority_kwargs(request_id),
             )
         if table is None and self.paged_cache_manager is not None:
             table = self.paged_cache_manager.get_block_table(store_id)
@@ -16473,6 +16482,54 @@ class Scheduler:
 
         return layer_cache_types
 
+    def _cache_priority_kwargs(self, request_id: str) -> dict[str, str]:
+        request = self.requests.get(request_id)
+        return {"cache_priority": "low"} if getattr(request, "cache_priority", "normal") == "low" else {}
+
+    def _promote_prefix_cache(self, request: Request) -> None:
+        if (
+            request.cached_tokens <= 0
+            or getattr(request, "cache_priority", "normal") == "low"
+            or getattr(self, "paged_ssd_cache_manager", None) is None
+        ):
+            return
+        for block_id in request.block_table.block_ids:
+            block = self.paged_cache_manager.allocated_blocks.get(block_id)
+            if block is not None and block.block_hash:
+                self.paged_ssd_cache_manager.promote_block(block.block_hash)
+
+    def _record_low_priority_request(self, request_id: str, table: Any) -> None:
+        request = self.requests.get(request_id)
+        if (
+            table is None
+            or request is None
+            or getattr(request, "cache_priority", "normal") != "low"
+            or request.skip_cache_store
+            or request.status == RequestStatus.FINISHED_ABORTED
+            or self.paged_ssd_cache_manager is None
+        ):
+            return
+        with self.paged_cache_manager._lock:
+            hashes = tuple(
+                block.block_hash
+                for bid in table.block_ids
+                if (block := self.paged_cache_manager.allocated_blocks.get(bid))
+                is not None
+                and block.block_hash is not None
+            )
+        self.paged_ssd_cache_manager.record_low_priority_request(request_id, hashes)
+
+    def _referenced_ssd_hashes(self) -> set[bytes]:
+        manager = self.paged_cache_manager
+        if manager is None:
+            return set()
+        with manager._lock:
+            return {
+                block.block_hash
+                for block in manager.allocated_blocks.values()
+                if block.ref_count > 0 and block.block_hash is not None
+            }
+
     def _init_tiered_cache(self) -> bool:
         """Initialize paged SSD cache components if configured.
 
@@ -16563,6 +16620,13 @@ class Scheduler:
             self.paged_ssd_cache_manager = PagedSSDCacheManager(
                 cache_dir=cache_dir,
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
+                retained_request_count=self.config.max_num_seqs,
+                referenced_hashes=self._referenced_ssd_hashes,
+                reference_lock=(
+                    self.paged_cache_manager._lock
+                    if self.paged_cache_manager is not None
+                    else None
+                ),
                 auto_size=self.config.paged_ssd_cache_auto_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,

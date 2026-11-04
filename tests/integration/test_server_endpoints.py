@@ -3583,14 +3583,28 @@ class TestCacheStoreHeader:
             ),
         ],
     )
-    def test_header_reaches_engine(self, client, mock_llm_engine, path, body):
+    @pytest.mark.parametrize(
+        "headers,key,value",
+        [
+            ({"X-oMLX-Cache-Store": "off"}, "skip_cache_store", True),
+            ({"X-oMLX-Cache-Priority": "low"}, "cache_priority", "low"),
+            (
+                {"X-oMLX-Cache-Store": "off", "X-oMLX-Cache-Priority": "low"},
+                "cache_priority",
+                "low",
+            ),
+        ],
+    )
+    def test_header_reaches_engine(
+        self, client, mock_llm_engine, path, body, headers, key, value
+    ):
         recorded = self._record(mock_llm_engine)
 
-        response = client.post(path, json=body, headers={"X-oMLX-Cache-Store": "off"})
+        response = client.post(path, json=body, headers=headers)
         assert response.status_code == 200
-        assert recorded and recorded[-1].get("skip_cache_store") is True
+        assert recorded and recorded[-1].get(key) == value
 
         recorded.clear()
         response = client.post(path, json=body)
         assert response.status_code == 200
-        assert recorded and "skip_cache_store" not in recorded[-1]
+        assert recorded and key not in recorded[-1]

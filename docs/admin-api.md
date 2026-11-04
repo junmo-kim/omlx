@@ -49,6 +49,8 @@ Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, 
 
 The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
 
+`X-oMLX-Cache-Priority: low` marks stored prefix blocks as batch traffic. The SSD cache retains the chains of the most recent low-priority requests, up to the server's maximum concurrent requests. A low-priority save evicts older low-priority blocks first, then normal blocks, then retained low-priority chains. A normal save evicts all eligible low-priority blocks before normal blocks. Reuse by a normal request promotes shared blocks to normal priority; reuse by a low-priority request does not. In-use and pending blocks are protected while low-priority traffic is present. A save that cannot fit around those blocks is skipped instead of exceeding the SSD budget. Priority and completed-chain history survive restart. No header preserves the default behavior; `X-oMLX-Cache-Store: off` still prevents storage when both headers are present.
+
 ### Models
 
 | Endpoint | Description |
